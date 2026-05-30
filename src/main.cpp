@@ -32,6 +32,7 @@ static constexpr uint8_t IR_ADC_PIN = 34;
 static constexpr int32_t PASOS_VUELTA_360 = 200;
 static constexpr uint32_t PULSO_STEP_US = 5;
 static constexpr uint32_t RETARDO_ENTRE_PASOS_MS = 15;
+static constexpr uint32_t ULTRASONIDO_TIMEOUT_US = 12000;
 
 void tareaAdquisicion(void *pvParameters);
 void tareaProcesamiento(void *pvParameters);
@@ -65,8 +66,16 @@ void setup() {
     }
   }
 
-  xTaskCreatePinnedToCore(tareaAdquisicion, "tareaAdquisicion", 4096, &contexto, 2, nullptr, 0);
-  xTaskCreatePinnedToCore(tareaProcesamiento, "tareaProcesamiento", 4096, &contexto, 1, nullptr, 1);
+  BaseType_t okAdquisicion =
+      xTaskCreatePinnedToCore(tareaAdquisicion, "tareaAdquisicion", 4096, &contexto, 2, nullptr, 0);
+  BaseType_t okProcesamiento =
+      xTaskCreatePinnedToCore(tareaProcesamiento, "tareaProcesamiento", 4096, &contexto, 1, nullptr, 1);
+  if (okAdquisicion != pdPASS || okProcesamiento != pdPASS) {
+    Serial.println("Error: no se pudieron crear las tareas del pipeline");
+    while (true) {
+      delay(1000);
+    }
+  }
 }
 
 void loop() { vTaskDelay(pdMS_TO_TICKS(1000)); }
@@ -74,6 +83,7 @@ void loop() { vTaskDelay(pdMS_TO_TICKS(1000)); }
 void tareaAdquisicion(void *pvParameters) {
   ContextoPipeline *ctx = static_cast<ContextoPipeline *>(pvParameters);
   if (ctx == nullptr || ctx->colaMediciones == nullptr || ctx->laserSerial == nullptr) {
+    Serial.println("Error: contexto invalido en tareaAdquisicion");
     vTaskDelete(nullptr);
   }
 
@@ -87,7 +97,9 @@ void tareaAdquisicion(void *pvParameters) {
     medicion.distanciaIrRaw = leerSensorIrRaw();
     medicion.distanciaUltrasonidoCm = leerDistanciaUltrasonidoCm();
 
-    (void)xQueueSend(ctx->colaMediciones, &medicion, pdMS_TO_TICKS(10));
+    if (xQueueSend(ctx->colaMediciones, &medicion, pdMS_TO_TICKS(10)) != pdTRUE) {
+      Serial.println("Advertencia: cola de mediciones llena, muestra descartada");
+    }
     vTaskDelay(pdMS_TO_TICKS(RETARDO_ENTRE_PASOS_MS));
   }
 }
@@ -95,6 +107,7 @@ void tareaAdquisicion(void *pvParameters) {
 void tareaProcesamiento(void *pvParameters) {
   ContextoPipeline *ctx = static_cast<ContextoPipeline *>(pvParameters);
   if (ctx == nullptr || ctx->colaMediciones == nullptr) {
+    Serial.println("Error: contexto invalido en tareaProcesamiento");
     vTaskDelete(nullptr);
   }
 
@@ -128,12 +141,13 @@ void moverMotorVaiven(ContextoPipeline &ctx) {
 }
 
 int16_t leerDistanciaLaserMm(HardwareSerial &serialLaser) {
-  while (serialLaser.available() > 9) {
-    (void)serialLaser.read();
+  int disponibles = serialLaser.available();
+  if (disponibles < 9) {
+    return -1;
   }
 
-  if (serialLaser.available() < 9) {
-    return -1;
+  while (serialLaser.available() > 9) {
+    (void)serialLaser.read();
   }
 
   uint8_t frame[9] = {0};
@@ -158,7 +172,7 @@ int32_t leerDistanciaUltrasonidoCm() {
   delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
 
-  unsigned long duracionUs = pulseIn(ECHO_PIN, HIGH, 25000UL);
+  unsigned long duracionUs = pulseIn(ECHO_PIN, HIGH, ULTRASONIDO_TIMEOUT_US);
   if (duracionUs == 0) {
     return -1;
   }
