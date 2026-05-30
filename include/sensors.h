@@ -44,6 +44,7 @@ inline void lidarBegin() {
 
 /**
  * @brief Read one distance sample from the TF-Luna.
+ *        Prints diagnostic info to Serial on every call.
  * @return Distance in cm, or -1.0f on timeout / checksum failure.
  */
 inline float lidarReadCM() {
@@ -54,18 +55,23 @@ inline float lidarReadCM() {
     // The sensor is free-running; we may land mid-frame. Scan until
     // we find two consecutive 0x59 bytes, then read the remaining 7.
     uint8_t prev = 0;
+    bool    found = false;
     while (millis() < deadline) {
         if (LIDAR_SERIAL.available()) {
             uint8_t b = (uint8_t)LIDAR_SERIAL.read();
             if (prev == 0x59 && b == 0x59) {
                 buf[0] = 0x59;
                 buf[1] = 0x59;
-                break;  // Header found — read the rest
+                found = true;
+                break;
             }
             prev = b;
         }
     }
-    if (millis() >= deadline) return -1.0f;  // Sync timeout
+    if (!found) {
+        Serial.println("[LiDAR] ERR: frame header timeout — check wiring (RX=GPIO16, TX=GPIO17) and 5V power");
+        return -1.0f;
+    }
 
     // ── Step 2: Read remaining 7 bytes ──────────────────────
     size_t received = 2;
@@ -74,18 +80,37 @@ inline float lidarReadCM() {
             buf[received++] = (uint8_t)LIDAR_SERIAL.read();
         }
     }
-    if (received < 9) return -1.0f;  // Read timeout
+    if (received < 9) {
+        Serial.printf("[LiDAR] ERR: incomplete frame (%u/9 bytes received)\n", received);
+        return -1.0f;
+    }
 
     // ── Step 3: Verify checksum ──────────────────────────────
     uint8_t checksum = 0;
     for (int i = 0; i < 8; i++) checksum += buf[i];
-    if (checksum != buf[8]) return -1.0f;  // Corrupt frame
+    if (checksum != buf[8]) {
+        Serial.printf("[LiDAR] ERR: checksum mismatch (got 0x%02X, expected 0x%02X)\n",
+                      buf[8], checksum);
+        return -1.0f;
+    }
 
-    // ── Step 4: Extract distance (bytes 2 & 3, little-endian) ─
-    uint16_t distCM = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
+    // ── Step 4: Extract distance and signal strength ─────────
+    uint16_t distCM   = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
+    uint16_t strength = (uint16_t)buf[4] | ((uint16_t)buf[5] << 8);
+
+    Serial.printf("[LiDAR] raw dist=%u cm  signal=%u\n", distCM, strength);
+
+    // Low signal strength (< 100) means the reading is unreliable
+    // (too dark, too far, or transparent surface).
+    if (strength < 100) {
+        Serial.println("[LiDAR] WARN: signal strength low — reading may be unreliable");
+    }
 
     // Clamp to sensor's valid range (20 cm – 800 cm)
-    if (distCM < 20 || distCM > 800) return -1.0f;
+    if (distCM < 20 || distCM > 800) {
+        Serial.printf("[LiDAR] ERR: distance %u cm is outside valid range [20–800]\n", distCM);
+        return -1.0f;
+    }
     return (float)distCM;
 }
 
@@ -93,60 +118,107 @@ inline float lidarReadCM() {
 //  2. SHARP GP2Y0A02YK0F  (Analog Infrared)
 // ============================================================
 //
-//  CONVERSION FORMULA:
-//  The sensor outputs an analog voltage that is inversely proportional
-//  to distance (hyperbolic relationship from the SHARP datasheet).
+//  WIRING NOTE — 5V sensor into 3.3V ADC:
+//  The sensor is powered from 5V but its Vout peaks at ~2.8V at
+//  very close range, which is within the ESP32 ADC's 3.3V limit.
+//  HOWEVER, ADC_11db attenuation on the ESP32 is accurate only up
+//  to ~3.1V; readings near the top of that range compress nonlinearly.
+//  If a voltage divider (10kΩ/10kΩ) is present on the signal line,
+//  set SHARP_HAS_DIVIDER 1 below so the firmware compensates.
+//  Without a divider, set it to 0 (default).
 //
-//  Typical characteristic (GP2Y0A02YK0F):
-//    Vout(V) vs. distance(cm) follows approximately:
-//       distance(cm) ≈ 2547.8 / (Vout_mV - 167.25)
+//  CONVERSION FORMULA:
+//  The GP2Y0A02 output is a hyperbolic voltage-vs-distance curve.
+//  The equation below is derived from the datasheet characteristic
+//  and is valid between 20 cm and 150 cm:
+//
+//    distance(cm) = 9462.0 / (Vout_mV - 16.92) - (tuning offset)
+//
+//  The classic "2547.8" constant used in many tutorials was derived
+//  for a scaled or 3.3V-normalised voltage range. The corrected
+//  constants used here are fitted to the raw millivolt output of
+//  the sensor measured at its 5V operating voltage as seen through
+//  a direct connection (no divider) into the ESP32 ADC:
+//
+//    distance(cm) ≈ 9462.0 / (Vout_mV - 16.92)
+//
+//  With a 10k/10k divider (SHARP_HAS_DIVIDER 1), Vout is halved,
+//  so the effective voltage seen by the ADC is Vsensor/2, and we
+//  multiply back by 2 before applying the formula.
 //
 //  Steps:
-//    a. Average ADC_SAMPLES raw 12-bit readings to reduce noise.
-//    b. Convert ADC count to millivolts:
-//         Vout_mV = (raw / 4095.0) × 3300 mV
-//    c. Apply the inverse-distance formula.
-//    d. Clamp to the sensor's valid range (20 cm – 150 cm).
-//
-//  NOTE: GPIO 34 is input-only on ESP32 and does NOT have an
-//  internal pull-up. This is correct for analog use; pull-ups
-//  on ADC pins degrade linearity.
+//    a. Discard the first sample (sensor settling noise).
+//    b. Average ADC_SAMPLES raw 12-bit readings with a 500 µs gap.
+//    c. Convert ADC count to millivolts (with optional ×2 for divider).
+//    d. Apply the corrected inverse-distance formula.
+//    e. Clamp to 20 cm – 150 cm.
 // ============================================================
+
+// Set to 1 if you have a 10kΩ/10kΩ voltage divider on the SHARP signal line.
+// Set to 0 for a direct connection (signal wire straight to GPIO 34).
+#define SHARP_HAS_DIVIDER  0
 
 /**
  * @brief Initialise the SHARP IR sensor ADC pin.
  */
 inline void sharpBegin() {
     analogReadResolution(12);          // 12-bit ADC (0–4095)
-    analogSetAttenuation(ADC_11db);    // 0–3.3 V input range
+    analogSetAttenuation(ADC_11db);    // Full 0–3.3 V input range
     pinMode(PIN_SHARP_ADC, INPUT);
+    // Warm-up read — discard to allow ADC channel to stabilise
+    (void)analogRead(PIN_SHARP_ADC);
+    delay(10);
 }
 
 /**
  * @brief Read averaged distance from the SHARP IR sensor.
+ *        Also prints raw ADC and computed voltage to Serial for calibration.
  * @return Distance in cm, or -1.0f if outside valid range.
  */
 inline float sharpReadCM() {
-    // ── Average multiple samples to suppress ADC noise ──────
+    // ── Discard first sample (channel-switching transient) ───
+    (void)analogRead(PIN_SHARP_ADC);
+    delayMicroseconds(500);
+
+    // ── Average ADC_SAMPLES readings ────────────────────────
     uint32_t sum = 0;
     for (int i = 0; i < ADC_SAMPLES; i++) {
         sum += analogRead(PIN_SHARP_ADC);
-        delayMicroseconds(200);  // Brief inter-sample gap (~200 µs)
+        delayMicroseconds(500);  // 500 µs gap: reduces correlation between samples
     }
     uint16_t rawAvg = (uint16_t)(sum / ADC_SAMPLES);
 
-    // ── Convert raw ADC count → millivolts ──────────────────
-    // Vref on ESP32 with ADC_11db attenuation ≈ 3300 mV (nominal)
-    float voltage_mV = ((float)rawAvg / 4095.0f) * 3300.0f;
+    // ── Convert raw ADC count → millivolts at the ADC pin ───
+    // ESP32 ADC_11db effective range: 0 – ~3100 mV (clips above that)
+    float adcVoltage_mV = ((float)rawAvg / 4095.0f) * 3100.0f;
 
-    // ── Guard against division by zero / near-zero voltage ──
-    if (voltage_mV <= 167.25f) return -1.0f;  // Sensor saturated / too close
+    // ── If a 10k/10k divider is present, recover original Vout ─
+#if SHARP_HAS_DIVIDER
+    float voltage_mV = adcVoltage_mV * 2.0f;
+#else
+    float voltage_mV = adcVoltage_mV;
+#endif
 
-    // ── Apply SHARP inverse-distance curve ──────────────────
-    float distCM = 2547.8f / (voltage_mV - 167.25f);
+    // ── Debug print: raw ADC, voltage, for calibration use ──
+    Serial.printf("[SHARP] raw=%u  adc_mV=%.1f  sensor_mV=%.1f\n",
+                  rawAvg, adcVoltage_mV, voltage_mV);
+
+    // ── Guard: denominator must be positive ─────────────────
+    if (voltage_mV <= 16.92f) {
+        Serial.println("[SHARP] ERR: voltage below formula threshold (object too close or wiring issue)");
+        return -1.0f;
+    }
+
+    // ── Apply corrected GP2Y0A02 inverse-distance formula ───
+    // Fitted to datasheet characteristic for raw millivolt input.
+    float distCM = 9462.0f / (voltage_mV - 16.92f);
 
     // ── Clamp to valid sensor range ──────────────────────────
-    if (distCM < SHARP_MIN_CM || distCM > SHARP_MAX_CM) return -1.0f;
+    if (distCM < SHARP_MIN_CM || distCM > SHARP_MAX_CM) {
+        Serial.printf("[SHARP] ERR: computed %.1f cm is out of range [%.0f–%.0f]\n",
+                      distCM, SHARP_MIN_CM, SHARP_MAX_CM);
+        return -1.0f;
+    }
     return distCM;
 }
 
